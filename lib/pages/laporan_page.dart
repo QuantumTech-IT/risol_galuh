@@ -6,15 +6,44 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:blue_thermal_printer/blue_thermal_printer.dart';
 import 'package:risol_galuh/pages/login_page.dart';
 
+final BlueThermalPrinter bluetooth = BlueThermalPrinter.instance;
+
+/* ---------- Helpers & models ---------- */
+
+class ItemSummary {
+  final int pcs;
+  final double omzet; // qty * harga
+  const ItemSummary({this.pcs = 0, this.omzet = 0});
+  ItemSummary add(int q, double h) => ItemSummary(pcs: pcs + q, omzet: omzet + q * h);
+}
+
+int _toInt(dynamic v) {
+  if (v == null) return 0;
+  final s = v.toString().replaceAll(RegExp(r'[^0-9-]'), '');
+  return int.tryParse(s) ?? 0;
+}
+
+double _toDouble(dynamic v) {
+  if (v == null) return 0;
+  final s = v.toString().replaceAll(RegExp(r'[^0-9.-]'), '');
+  return double.tryParse(s) ?? 0.0;
+}
+
+String rupiah(num v) => 'Rp${v.toStringAsFixed(0).replaceAllMapped(
+  RegExp(r'(\d)(?=(\d{3})+(?!\d))'), (m) => '${m[1]}.')}';
+
+/* -------------------------------------- */
+
 class LaporanPage extends StatefulWidget {
   const LaporanPage({super.key});
   @override
   State<LaporanPage> createState() => _LaporanPageState();
 }
 
-final BlueThermalPrinter bluetooth = BlueThermalPrinter.instance;
-
 class _LaporanPageState extends State<LaporanPage> {
+  final _idr = NumberFormat.currency(locale: 'id_ID', symbol: 'Rp', decimalDigits: 0);
+
+  // data mentah dari API (flat/tiap baris 1 item)
   List<Map<String, dynamic>> data = [];
   bool isLoading = true;
 
@@ -22,11 +51,13 @@ class _LaporanPageState extends State<LaporanPage> {
   DateTime tglAwal = DateTime.now();
   DateTime tglAkhir = DateTime.now();
 
-  // ringkasan
-  double totalPenjualan = 0; // Rp
-  int totalItemTerjual = 0;  // pcs
+  // ringkasan total
+  double totalPenjualan = 0;
+  int totalItemTerjual = 0;
 
-  final _idr = NumberFormat.currency(locale: 'id_ID', symbol: 'Rp', decimalDigits: 0);
+  // ringkasan per item (di-state)
+  Map<String, ItemSummary> ringkasanPerItem = {};
+  List<MapEntry<String, ItemSummary>> ringkasanSorted = [];
 
   @override
   void initState() {
@@ -39,6 +70,8 @@ class _LaporanPageState extends State<LaporanPage> {
       isLoading = true;
       totalPenjualan = 0;
       totalItemTerjual = 0;
+      ringkasanPerItem = {};
+      ringkasanSorted = [];
     });
 
     final tAwal = DateFormat('yyyy-MM-dd').format(tglAwal);
@@ -46,24 +79,39 @@ class _LaporanPageState extends State<LaporanPage> {
 
     try {
       final res = await http.get(Uri.parse(
-          'https://bpjsapi.quantumtechapp.com/risol-api/get_riwayat_transaksi.php?tgl_awal=$tAwal&tgl_akhir=$tAkhir'));
+        'https://bpjsapi.quantumtechapp.com/risol-api/get_riwayat_transaksi.php?tgl_awal=$tAwal&tgl_akhir=$tAkhir',
+      ));
       final json = jsonDecode(res.body);
 
       if (json['success'] == true) {
         final list = List<Map<String, dynamic>>.from(json['data']);
 
-        // hitung ringkasan
         double sumRp = 0;
         int sumQty = 0;
+        final Map<String, ItemSummary> perItem = {};
+
         for (final r in list) {
-          sumRp += (double.tryParse(r['total'].toString()) ?? 0);
-          sumQty += (int.tryParse(r['jumlah'].toString()) ?? 0);
+          // total semua
+          sumRp += _toDouble(r['total']);   // ini subtotal baris (qty * h_jual)
+          sumQty += _toInt(r['jumlah']);
+
+          // ringkasan per item dari kolom yang dipakai di UI
+          final nama  = (r['nama_brng'] ?? '').toString().trim().toUpperCase();
+          final qty   = _toInt(r['jumlah']);
+          final harga = _toDouble(r['h_jual']);
+          if (nama.isEmpty || qty == 0) continue;
+          perItem[nama] = (perItem[nama] ?? const ItemSummary()).add(qty, harga);
         }
+
+        final sorted = perItem.entries.toList()
+          ..sort((a, b) => b.value.pcs.compareTo(a.value.pcs));
 
         setState(() {
           data = list;
           totalPenjualan = sumRp;
           totalItemTerjual = sumQty;
+          ringkasanPerItem = perItem;
+          ringkasanSorted = sorted;
           isLoading = false;
         });
       } else {
@@ -102,7 +150,7 @@ class _LaporanPageState extends State<LaporanPage> {
     }
   }
 
-  // group by nota_jual
+  // group baris flat menjadi per nota
   Map<String, List<Map<String, dynamic>>> _groupByNota(List<Map<String, dynamic>> rows) {
     final g = <String, List<Map<String, dynamic>>>{};
     for (final r in rows) {
@@ -112,11 +160,10 @@ class _LaporanPageState extends State<LaporanPage> {
     return g;
   }
 
-  // cetak laporan harian (opsional, tidak diubah)
+  // cetak laporan (tetap seperti yang kamu punya)
   void cetakLaporanHarian() async {
     final tanggal = DateFormat('yyyy-MM-dd').format(tglAwal);
     final transaksiHariIni = data.where((e) => e['tgl_jual'].toString().startsWith(tanggal)).toList();
-
     if (transaksiHariIni.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Tidak ada transaksi untuk tanggal ini.')),
@@ -125,7 +172,6 @@ class _LaporanPageState extends State<LaporanPage> {
     }
 
     final g = _groupByNota(transaksiHariIni);
-
     try {
       bool isConnected = await bluetooth.isConnected ?? false;
       if (!isConnected) {
@@ -154,9 +200,9 @@ class _LaporanPageState extends State<LaporanPage> {
 
         for (final r in rows) {
           final nm = r['nama_brng'];
-          final j = int.tryParse(r['jumlah'].toString()) ?? 0;
-          final hj = int.tryParse(r['h_jual'].toString()) ?? 0;
-          final sub = double.tryParse(r['total'].toString()) ?? 0;
+          final j  = _toInt(r['jumlah']);
+          final hj = _toInt(r['h_jual']);
+          final sub = _toDouble(r['total']);
           qty += j;
           total += sub;
           bluetooth.printCustom("$nm x$j @${_idr.format(hj)}", 1, 0);
@@ -177,9 +223,11 @@ class _LaporanPageState extends State<LaporanPage> {
       bluetooth.printNewLine();
       bluetooth.paperCut();
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Struk berhasil dicetak')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Struk berhasil dicetak')),
+        );
+      }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text("Gagal cetak: $e")),
@@ -197,6 +245,56 @@ class _LaporanPageState extends State<LaporanPage> {
       (route) => false,
     );
   }
+
+  /* ---------- UI helpers inside State ---------- */
+
+  Widget ringkasanChips() {
+    if (ringkasanSorted.isEmpty) {
+      return const Text(
+        'Belum ada ringkasan untuk rentang tanggal ini',
+        style: TextStyle(color: Colors.black54, fontSize: 12),
+      );
+    }
+    final shown = ringkasanSorted.take(6).toList(); // tampilkan 6 dulu
+    return Wrap(
+      spacing: 8, runSpacing: 8,
+      children: shown.map((e) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: const Color.fromARGB(255, 3, 228, 153),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: const Color(0xffE0E0E0)),
+        ),
+        child: Text(
+          "${e.key}: ${e.value.pcs} pcs • ${rupiah(e.value.omzet)}",
+          style: const TextStyle(fontSize: 12),
+        ),
+      )).toList(),
+    );
+  }
+
+  void _lihatSemuaRingkasan(BuildContext ctx) {
+    if (ringkasanSorted.isEmpty) return;
+    Navigator.push(ctx, MaterialPageRoute(builder: (_) => Scaffold(
+      appBar: AppBar(title: const Text('Ringkasan Per Item')),
+      body: ListView.separated(
+        itemCount: ringkasanSorted.length,
+        separatorBuilder: (_, __) => const Divider(height: 1),
+        itemBuilder: (_, i) {
+          final e = ringkasanSorted[i];
+          return ListTile(
+            title: Text(e.key),
+            trailing: Text(
+              "${e.value.pcs} pcs • ${rupiah(e.value.omzet)}",
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+          );
+        },
+      ),
+    )));
+  }
+
+  /* -------------------------------------------- */
 
   @override
   Widget build(BuildContext context) {
@@ -218,24 +316,25 @@ class _LaporanPageState extends State<LaporanPage> {
           ),
         ],
       ),
+
       body: Column(
         children: [
           // filter tanggal
           Padding(
-            padding: const EdgeInsets.all(12.0),
+            padding: const EdgeInsets.all(5.0),
             child: Row(
               children: [
                 Expanded(
                   child: InkWell(
                     onTap: () => _pilihTanggal(context, true),
-                    child: _DateBox(label: "Awal", date: tglAwal),
+                    child: _DateBoxMini(label: "Awal", date: tglAwal),
                   ),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: 2),
                 Expanded(
                   child: InkWell(
                     onTap: () => _pilihTanggal(context, false),
-                    child: _DateBox(label: "Akhir", date: tglAkhir),
+                    child: _DateBoxMini(label: "Akhir", date: tglAkhir),
                   ),
                 ),
                 const SizedBox(width: 8),
@@ -248,34 +347,58 @@ class _LaporanPageState extends State<LaporanPage> {
             ),
           ),
 
-          // ringkasan total rupiah + total item
+          // Ringkasan (Card)
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12.0),
-            child: Row(
-              children: [
-                Text('Total Penjualan: ',
-                    style: const TextStyle(fontWeight: FontWeight.w600)),
-                Text(_idr.format(totalPenjualan),
-                    style: const TextStyle(
-                        color: Colors.blue, fontWeight: FontWeight.bold)),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-            child: Row(
-              children: [
-                Text('Total Item Terjual: ',
-                    style: const TextStyle(fontWeight: FontWeight.w600)),
-                Text('$totalItemTerjual pcs',
-                    style: const TextStyle(
-                        color: Colors.green, fontWeight: FontWeight.bold)),
-              ],
+            padding: const EdgeInsets.symmetric(horizontal: 8.0),
+            child: Card(
+              elevation: 0.5,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              child: Padding(
+                padding: const EdgeInsets.all(12.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Text(
+                          "Ringkasan per Item",
+                          style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
+                        ),
+                        const Spacer(),
+                        TextButton.icon(
+                          onPressed: () => _lihatSemuaRingkasan(context),
+                          icon: const Icon(Icons.list_alt, size: 16),
+                          label: const Text("Lihat semua", style: TextStyle(fontSize: 12)),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    ringkasanChips(),
+                    const Divider(height: 24),
+                    Row(
+                      children: [
+                        const Text('Total Penjualan: ', style: TextStyle(fontWeight: FontWeight.w600)),
+                        Text(_idr.format(totalPenjualan),
+                            style: const TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        const Text('Total Item Terjual: ', style: TextStyle(fontWeight: FontWeight.w600)),
+                        Text("$totalItemTerjual pcs",
+                            style: const TextStyle(color: Colors.green, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
             ),
           ),
 
           const SizedBox(height: 4),
 
+          // daftar per nota
           Expanded(
             child: isLoading
                 ? const Center(child: CircularProgressIndicator())
@@ -289,12 +412,11 @@ class _LaporanPageState extends State<LaporanPage> {
                           final rows = entry.value;
                           final first = rows.first;
 
-                          // hitung total per nota + total item per nota
                           double total = 0;
                           int totalItemNota = 0;
                           for (final r in rows) {
-                            total += (double.tryParse(r['total'].toString()) ?? 0);
-                            totalItemNota += (int.tryParse(r['jumlah'].toString()) ?? 0);
+                            total += _toDouble(r['total']);
+                            totalItemNota += _toInt(r['jumlah']);
                           }
 
                           return Card(
@@ -304,18 +426,16 @@ class _LaporanPageState extends State<LaporanPage> {
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-                                  Text("Nota: $nota",
-                                      style: const TextStyle(fontWeight: FontWeight.bold)),
+                                  Text("Nota: $nota", style: const TextStyle(fontWeight: FontWeight.bold)),
                                   Text("Tanggal: ${first['tgl_jual']}"),
                                   Text("Cara Bayar: ${first['nama_bayar'] ?? '-'}"),
                                   const Divider(),
                                   ...rows.map((r) => Row(
-                                        mainAxisAlignment:
-                                            MainAxisAlignment.spaceBetween,
+                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
                                         children: [
                                           Expanded(child: Text("${r['nama_brng']}")),
-                                          Text("${r['jumlah']} x ${_idr.format(int.tryParse(r['h_jual'].toString()) ?? 0)}"),
-                                          Text("= ${_idr.format(double.tryParse(r['total'].toString()) ?? 0)}"),
+                                          Text("${r['jumlah']} x ${_idr.format(_toInt(r['h_jual']))}"),
+                                          Text("= ${_idr.format(_toDouble(r['total']))}"),
                                         ],
                                       )),
                                   const Divider(),
@@ -336,24 +456,31 @@ class _LaporanPageState extends State<LaporanPage> {
   }
 }
 
-class _DateBox extends StatelessWidget {
+/* ---------- Mini DateBox ---------- */
+
+class _DateBoxMini extends StatelessWidget {
   final String label;
-  final DateTime date;
-  const _DateBox({required this.label, required this.date});
+  final DateTime? date;
+
+  const _DateBoxMini({required this.label, this.date});
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 10),
+      height: 38,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
-        border: Border.all(color: Colors.blueGrey),
-        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.grey),
+        borderRadius: BorderRadius.circular(6),
       ),
       child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          const Icon(Icons.date_range),
-          const SizedBox(width: 8),
-          Text("$label: ${DateFormat('dd/MM/yyyy').format(date)}"),
+          Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+          Text(
+            date != null ? "${date!.day}-${date!.month}-${date!.year}" : "-",
+            style: const TextStyle(fontSize: 12, color: Colors.black54),
+          ),
         ],
       ),
     );
